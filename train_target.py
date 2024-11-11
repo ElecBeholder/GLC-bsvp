@@ -4,6 +4,8 @@ import torch
 import shutil 
 import numpy as np
 
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 from tqdm import tqdm 
 from model.SFUniDA import SFUniDA
 from dataset.dataset import SFUniDADataset
@@ -34,6 +36,39 @@ def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
 best_score = 0.0
 best_coeff = 1.0
 
+# global_cls_prob_bank: [C, C]
+global_cls_prob_bank = None
+
+def bsvp_finetune(args, model, dataloader, optimizer):
+    global global_cls_prob_bank
+    model.train()
+
+    for _, imgs, labels, _ in tqdm(dataloader, ncols=60):
+        imgs = imgs.to(args.device)
+        _, pred_cls = model(imgs, apply_softmax=True)
+        pred_unc = Entropy(pred_cls)/np.log(args.class_num)
+        _, pred_cls_label = torch.max(pred_cls, dim=1)
+        detached_pred_cls = pred_cls.detach()
+        bsvp_loss = torch.zeros(1).to(args.device)
+
+        for i in args.source_class_list:
+            mask_cls_i_all = (pred_cls_label == i).view(-1,1) 
+            if torch.sum(mask_cls_i_all) != 0:
+                mask_cls_i_wo_unkown = (pred_cls_label == i).view(-1,1) * (pred_unc < args.w_0).view(-1,1)
+                mask_cls_i_unkown = (pred_cls_label == i).view(-1,1) * ~(pred_unc < args.w_0).view(-1,1)
+                global_cls_prob_bank[i] = 0.9 * global_cls_prob_bank[i] + \
+                                          0.1 * (torch.sum((mask_cls_i_wo_unkown * pred_cls) + \
+                                                           (mask_cls_i_unkown * detached_pred_cls), dim=0) / \
+                                                 torch.sum(mask_cls_i_all))
+        _, sv_list, _ = torch.svd(global_cls_prob_bank)
+        bsvp_loss = args.lam_bsvp * \
+                    torch.mean(
+                    torch.sigmoid((sv_list - torch.mean(sv_list)) / torch.std(sv_list))[-args.bsvp_r:])
+        optimizer.zero_grad()
+        bsvp_loss.backward()
+        optimizer.step()
+        global_cls_prob_bank = global_cls_prob_bank.detach()
+
 @torch.no_grad()
 def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
     model.eval()
@@ -47,11 +82,11 @@ def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
     
     for _, imgs_test, imgs_label, _ in tqdm(dataloader, ncols=60):
         
-        imgs_test = imgs_test.cuda()
+        imgs_test = imgs_test.to(args.device)
         embed_feat, pred_cls = model(imgs_test, apply_softmax=True)
         pred_cls_bank.append(pred_cls)
         embed_feat_bank.append(embed_feat)
-        gt_label_bank.append(imgs_label.cuda())
+        gt_label_bank.append(imgs_label.to(args.device))
     
     pred_cls_bank = torch.cat(pred_cls_bank, dim=0) #[N, C]
     gt_label_bank = torch.cat(gt_label_bank, dim=0) #[N]
@@ -91,6 +126,17 @@ def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
     sorted_pred_cls, sorted_pred_cls_idxs = torch.sort(pred_cls_bank, dim=0, descending=True)
     pos_topk_idxs = sorted_pred_cls_idxs[:pos_topk_num, :].t() #[C, pos_topk_num]
     neg_topk_idxs = sorted_pred_cls_idxs[pos_topk_num:, :].t() #[C, neg_topk_num]
+
+    # generate global_cls_prob_bank for bsvp
+    global global_cls_prob_bank
+    pos_topk_idxs_bsvp = pos_topk_idxs.unsqueeze(2).expand([-1, -1, args.class_num]) #[C, pos_topk_num, C]
+    pred_cls_bank_bsvp = pred_cls_bank.unsqueeze(0).expand([args.class_num, -1, -1]) #[C, N, C]
+    global_cls_prob_bank = torch.mean(torch.gather(pred_cls_bank_bsvp, 1, pos_topk_idxs_bsvp), dim=1)
+    _, pred_cls_label = torch.max(pred_cls_bank, dim=1)
+    for i in args.source_class_list:
+        mask_cls_i = (pred_cls_label == i).view(-1,1)
+        if torch.sum(mask_cls_i) != 0:
+            global_cls_prob_bank[i] = torch.sum(mask_cls_i * pred_cls_bank, dim=0) / torch.sum(mask_cls_i)
     
     pos_topk_idxs = pos_topk_idxs.unsqueeze(2).expand([-1, -1, args.embed_feat_dim]) #[C, pos_topk_num, D]
     neg_topk_idxs = neg_topk_idxs.unsqueeze(2).expand([-1, -1, args.embed_feat_dim]) #[C, neg_topk_num, D]
@@ -98,30 +144,35 @@ def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
     embed_feat_bank_expand = embed_feat_bank.unsqueeze(0).expand([args.class_num, -1, -1]) #[C, N, D]
     pos_feat_sample = torch.gather(embed_feat_bank_expand, 1, pos_topk_idxs)
         
-    pos_cls_prior = torch.mean(sorted_pred_cls[:(pos_topk_num), :], dim=0, keepdim=True).t() * (1.0 - args.rho) + args.rho
-    
-    args.logger.info("POS_CLS_PRIOR:\t" + "\t".join(["{:.3f}".format(item) for item in pos_cls_prior.cpu().squeeze().numpy()]))
+    # prior fix for the first epoch
+    if epoch_idx == 0.0:
+        pos_cls_prior = torch.mean(sorted_pred_cls[:(pos_topk_num), :], dim=0, keepdim=True).t() * (1.0 - args.rho) + args.rho
+        args.logger.info("POS_CLS_PRIOR:\t" + "\t".join(["{:.3f}".format(item) for item in pos_cls_prior.cpu().squeeze().numpy()]))
     
     pos_feat_proto = torch.mean(pos_feat_sample, dim=1, keepdim=True) #[C, 1, D]
     pos_feat_proto = pos_feat_proto / torch.norm(pos_feat_proto, p=2, dim=-1, keepdim=True)
 
     faiss_kmeans = faiss.Kmeans(args.embed_feat_dim, KK, niter=100, verbose=False, min_points_per_centroid=1, gpu=False)
     
-    feat_proto_pos_simi = torch.zeros((data_num, args.class_num)).cuda() #[N, C]
-    feat_proto_max_simi = torch.zeros((data_num, args.class_num)).cuda() #[N, C]
-    feat_proto_max_idxs = torch.zeros((data_num, args.class_num)).cuda() #[N, C]
+    feat_proto_pos_simi = torch.zeros((data_num, args.class_num)).to(args.device) #[N, C]
+    feat_proto_max_simi = torch.zeros((data_num, args.class_num)).to(args.device) #[N, C]
+    feat_proto_max_idxs = torch.zeros((data_num, args.class_num)).to(args.device) #[N, C]
     
     # One-vs-all class pseudo-labeling
     for cls_idx in range(args.class_num):
         neg_feat_cls_sample_np = torch.gather(embed_feat_bank, 0, neg_topk_idxs[cls_idx, :]).cpu().numpy()
         faiss_kmeans.train(neg_feat_cls_sample_np)
-        cls_neg_feat_proto = torch.from_numpy(faiss_kmeans.centroids).cuda()
+        cls_neg_feat_proto = torch.from_numpy(faiss_kmeans.centroids).to(args.device)
         cls_neg_feat_proto = cls_neg_feat_proto / torch.norm(cls_neg_feat_proto, p=2, dim=-1, keepdim=True)#[K, D]
         cls_pos_feat_proto = pos_feat_proto[cls_idx, :] #[1, D]
         
         cls_pos_feat_proto_simi = torch.einsum("nd, kd -> nk", embed_feat_bank, cls_pos_feat_proto) #[N, 1]
         cls_neg_feat_proto_simi = torch.einsum("nd, kd -> nk", embed_feat_bank, cls_neg_feat_proto) #[N, K]
-        cls_pos_feat_proto_simi = cls_pos_feat_proto_simi * pos_cls_prior[cls_idx] #[N, 1]
+        # prior fix for the first epoch
+        if epoch_idx == 0.0:
+            cls_pos_feat_proto_simi = cls_pos_feat_proto_simi * pos_cls_prior[cls_idx] #[N, 1]
+        else:
+            cls_pos_feat_proto_simi = cls_pos_feat_proto_simi
         
         cls_feat_proto_simi = torch.cat([cls_pos_feat_proto_simi, cls_neg_feat_proto_simi], dim=1) #[N, 1+K]
         
@@ -147,7 +198,7 @@ def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
     hard_psd_label_bank[hard_label_unk, :] += 1.0
     hard_psd_label_bank = hard_psd_label_bank / (torch.sum(hard_psd_label_bank, dim=-1, keepdim=True) + 1e-4)
     
-    hard_psd_label_bank = hard_psd_label_bank.cuda()
+    hard_psd_label_bank = hard_psd_label_bank.to(args.device)
     
     per_class_num = np.zeros((len(class_list)))
     pre_class_num = np.zeros_like(per_class_num)
@@ -159,18 +210,36 @@ def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
         per_class_num[i] = float(len(label_idx))
         per_class_correct[i] = float(len(correct_idx))
     per_class_acc = per_class_correct / (per_class_num + 1e-5)
+
+    sp_pre_class_num = []
+    for i, labels in enumerate(args.source_class_list):
+        if labels not in args.target_class_list:
+            sp_pre_class_num.append(float(len(torch.where(hard_label == labels)[0])))
+    sp_pre_class_num = np.array(sp_pre_class_num)
+    ratio_sp_tt = np.sum(sp_pre_class_num) / np.sum(per_class_correct[:-1])
+    ratio_sp_ta = np.sum(sp_pre_class_num) / np.sum(pre_class_num[:-1])
     
     args.logger.info("PSD AVG ACC:\t" + "{:.3f}".format(np.mean(per_class_acc)))
     args.logger.info("PSD PER ACC:\t" + "\t".join(["{:.3f}".format(item) for item in per_class_acc]))
     args.logger.info("PER CLS NUM:\t" + "\t".join(["{:.0f}".format(item) for item in per_class_num]))
     args.logger.info("PRE CLS NUM:\t" + "\t".join(["{:.0f}".format(item) for item in pre_class_num]))
     args.logger.info("PRE ACC NUM:\t" + "\t".join(["{:.0f}".format(item) for item in per_class_correct]))
-    
+    args.logger.info("SP CLS NUM:\t" + "\t".join(["{:.0f}".format(item) for item in sp_pre_class_num]))
+    args.logger.info("SP/T_true:\t" + "{:.3f}".format(ratio_sp_tt*100))
+    args.logger.info("SP/T_all:\t" + "{:.3f}".format(ratio_sp_ta*100))
+
     return hard_psd_label_bank, pred_cls_bank, embed_feat_bank
 
 
-def train(args, model, train_dataloader, test_dataloader, optimizer, epoch_idx=0.0):
+def train(args, model, bsvp_dataloader, train_dataloader, test_dataloader, optimizer, epoch_idx=0.0):
     
+    # finetune the model with bsvp
+    if epoch_idx > 0.0:
+        args.logger.info("Finetuning the model with bsvp...")
+        for epoch_idx in range(args.bsvp_epoch):
+            args.logger.info("Finetune epoch: {}/{}".format(epoch_idx+1, args.bsvp_epoch))
+            bsvp_finetune(args, model, bsvp_dataloader, optimizer)
+
     model.eval()
     hard_psd_label_bank, pred_cls_bank, embed_feat_bank = obtain_global_pseudo_labels(args, model, test_dataloader,epoch_idx) 
     model.train()
@@ -186,8 +255,8 @@ def train(args, model, train_dataloader, test_dataloader, optimizer, epoch_idx=0
     for imgs_train, _, _, imgs_idx in tqdm(train_dataloader, ncols=60):
         
         iter_idx += 1
-        imgs_idx = imgs_idx.cuda()
-        imgs_train = imgs_train.cuda()
+        imgs_idx = imgs_idx.to(args.device)
+        imgs_train = imgs_train.to(args.device)
         
         hard_psd_label = hard_psd_label_bank[imgs_idx] #[B, C]
         
@@ -241,7 +310,7 @@ def test(args, model, dataloader, src_flg=False):
     
     for _, imgs_test, imgs_label, _ in tqdm(dataloader, ncols=60):
         
-        imgs_test = imgs_test.cuda() 
+        imgs_test = imgs_test.to(args.device) 
         _, pred_cls = model(imgs_test, apply_softmax=True)
         gt_label_stack.append(imgs_label)
         pred_cls_stack.append(pred_cls.cpu())
@@ -266,7 +335,7 @@ def main(args):
         print(args.checkpoint)
         raise ValueError("YOU MUST SET THE APPROPORATE SOURCE CHECKPOINT FOR TARGET MODEL ADPTATION!!!")
     
-    model = model.cuda()
+    model = model.to(args.device)
     save_dir = os.path.join(this_dir, "checkpoints_glc", args.dataset, "s_{}_t_{}".format(args.s_idx, args.t_idx),
                             args.target_label_type, args.note)
     
@@ -290,6 +359,11 @@ def main(args):
     
     target_data_list = open(os.path.join(args.target_data_dir, "image_unida_list.txt"), "r").readlines()
     target_dataset = SFUniDADataset(args, args.target_data_dir, target_data_list, d_type="target", preload_flg=True)
+
+    target_bsvp_dataloader = DataLoader(target_dataset, batch_size=args.batch_size*2, shuffle=True,
+                                         num_workers=args.num_workers, drop_last=True)
+    global global_cls_prob_bank
+    global_cls_prob_bank = torch.zeros(len(args.source_class_list), len(args.source_class_list)).to(args.device)
     
     target_train_dataloader = DataLoader(target_dataset, batch_size=args.batch_size, shuffle=True,
                                          num_workers=args.num_workers, drop_last=True)
@@ -305,9 +379,10 @@ def main(args):
     best_known_acc = 0.0
     best_unknown_acc = 0.0
     best_epoch_idx = 0
-    for epoch_idx in tqdm(range(args.epochs), ncols=60):
+    for epoch_idx in range(args.epochs):
         # Train on target
-        loss_dict =train(args, model, target_train_dataloader, target_test_dataloader, optimizer, epoch_idx)
+        args.logger.info("Epoch: {}/{}".format(epoch_idx+1, args.epochs))
+        loss_dict = train(args, model, target_bsvp_dataloader, target_train_dataloader, target_test_dataloader, optimizer, epoch_idx)
         args.logger.info("Epoch: {}/{},          train_all_loss:{:.3f},\n\
                           train_psd_loss:{:.3f}, train_knn_loss:{:.3f},".format(epoch_idx+1, args.epochs,
                                         loss_dict["all_pred_loss"], loss_dict["psd_pred_loss"], loss_dict["knn_pred_loss"]))

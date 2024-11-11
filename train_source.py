@@ -7,6 +7,8 @@ from model.SFUniDA import SFUniDA
 from dataset.dataset import SFUniDADataset
 from torch.utils.data.dataloader import DataLoader 
 
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 from config.model_config import build_args
 from utils.net_utils import set_logger, set_random_seed
 from utils.net_utils import compute_h_score, CrossEntropyLabelSmooth

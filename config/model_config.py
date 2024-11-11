@@ -13,9 +13,11 @@ def build_args():
 
     parser.add_argument("--checkpoint", default=None, type=str)
     parser.add_argument("--epochs", default=50, type=int)
+    parser.add_argument("--bsvp_epoch", default=10, type=int)
     
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--gpu", default='0', type=str)
+    parser.add_argument("--device", default='cuda', type=str)
     parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
@@ -25,9 +27,11 @@ def build_args():
     # we set lam_psd to 0.3 for Office and VisDA, 1.5 for OfficeHome and DomainNet
     parser.add_argument("--lam_psd", default=0.3, type=float) 
     parser.add_argument("--lam_knn", default=1.0, type=float)
+    parser.add_argument("--lam_bsvp", default=5.0, type=float)
     parser.add_argument("--local_K", default=4, type=int)
     parser.add_argument("--w_0", default=0.55, type=float)
     parser.add_argument("--rho", default=0.75, type=float)
+    parser.add_argument("--bsvp_r", default=2, type=int)
     
     parser.add_argument("--source_train_type", default="smooth", type=str, help="vanilla, smooth")
     parser.add_argument("--target_label_type", default="OPDA", type=str)

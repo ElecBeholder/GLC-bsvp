@@ -137,3 +137,6 @@ wandb
 # checkpoints
 # checkpoints_sfda
 *.pth
+
+# Mac Dir
+.DS_Store
