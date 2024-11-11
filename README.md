@@ -5,8 +5,8 @@
 This is a preliminary implementation of replacing [GLC](https://arxiv.org/abs/2303.07110) counterpart module with our [**Batch Singular Value Polarization**](https://icml.cc/virtual/2024/poster/32860), which demonstrates the plug-and-play nature of our module. We conducted Universal DA experiments on the Office-31, Office-Home, and VisDA, achieving an average improvement of 1.27 points over the original [GLC](https://arxiv.org/abs/2303.07110). This code is based on [GLC](https://arxiv.org/abs/2303.07110).
 
 ## Key insights of Batch Singular Value Polarization
-<img src="figures/max.pdf" width="500"/>
-<img src="figures/min.pdf" width="500"/>
+<img src="figures/max.png" width="500"/>
+<img src="figures/min.png" width="500"/>
 
 ## Prerequisites
 - python3, pytorch, numpy, PIL, scipy, sklearn, tqdm, etc.
